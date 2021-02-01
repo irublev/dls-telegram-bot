@@ -175,7 +175,7 @@ async def start_or_cancel_handler(message: types.Message):
     if content_img_url is not None and style_img_url_or_name is not None and message.get_command() == '/start':
         return SendMessage(message.chat.id, "We have an active request already processing, please wait or execute /cancel to stop the request execution")
     await _clean_userdata(message.chat.id)
-    if message.get_command() == '/start':
+    if message.get_command().lower() == '/start':
         return SendMessage(message.chat.id, "Please send me your image with content to stylize")
     elif content_img_url is None and style_img_url_or_name is None:
         return SendMessage(message.chat.id, "Nothing to cancel, please send me your image with content to stylize")
@@ -263,9 +263,33 @@ async def wrongcontent_handler(message: types.Message):
 async def _invoke_nst_endpoint(id, content_img_url, style_img_url):
     # noinspection PyBroadException
     try:
-        # invoke_endpoint
-        await asyncio.sleep(60)
-        raise Exception("Not yet implemented!")
+        config = aiobotocore.config.Config(
+            read_timeout=1200,
+            retries={
+                'max_attempts': 0
+            }
+        )
+        #sagemaker_runtime_client = boto3.client('sagemaker-runtime', config=config)
+        #sagemaker_client = Session(sagemaker_runtime_client=sagemaker_runtime_client)        
+        session = aiobotocore.get_session()
+        async with session.create_client('sagemaker-runtime', config=config) as sagemaker_client:
+            result_img_url = await _get_userdata_for_model_outputs(assume_userdata_exist=True, increment_counter=True)
+            _ = await client.invoke_endpoint(
+                EndpointName='NeuralStyleTransfer',
+                Body=json.dumps({'content_url': content_img_url, 'style_url': style_img_url, 'result_url': result_img_url, 'max_epochs': 10, 'n_steps_in_epoch': 20}),
+                ContentType='application/json',
+                Accept='application/json'
+            )
+        current_result_img_url = await _get_userdata_for_model_outputs(assume_userdata_exist=True, increment_counter=False)
+        if current_result_img_url == result_img_url:
+            prefix = _get_prefix(id)
+            async with aioboto3.resource("s3", **AWS_ACCESS_INFO_DICT) as s3:
+                bucket = await s3.Bucket(AWS_DEFAULT_BUCKET)
+                bucket_key = result_img_url[len("s3://") :]
+                bucket_name, key = bucket_key.split("/", 1)
+                result_s3_obj = await bucket.get_object(Key=key)
+                result_img_as_bytes = _read_s3_obj_as_bytes(result_s3_obj)
+            await bot.send_photo(id, result_img_as_bytes, caption='stylized via NST')                
     except Exception as e:
         logging.error(e)
         await _clean_userdata(id)
