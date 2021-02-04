@@ -48,11 +48,14 @@ MESSAGE_TO_CONTACT_SUPPORT = os.getenv('MESSAGE_TO_CONTACT_SUPPORT', 'please com
 CYCLEGAN_STYLENAME_TO_MODELNAME_DICT = {
     "Monet": "style_monet",
     "Van Gogh":"style_vangogh",
+    "Cezanne": "style_cezanne",
+    "Ukiyoe": "style_ukiyoe",
 }
 
 
 def get_stylechoice_markup():
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, selective=True, one_time_keyboard=True)
+    markup.row_width = 2
     style_name_list = list(CYCLEGAN_STYLENAME_TO_MODELNAME_DICT.keys())
     markup.add(*style_name_list)
     return markup
@@ -261,39 +264,52 @@ async def wrongcontent_handler(message: types.Message):
     await _wronginput_handler("Bad content", message)
 
 
+async def _sagemaker_invoke_endpoint(id, endpoint_name, input_params_dict, read_timeout=60):
+    config = aiobotocore.config.AioConfig(
+        read_timeout=read_timeout,
+        retries={
+            'max_attempts': 0
+        }
+    )
+    session = aiobotocore.get_session()
+    async with session.create_client('sagemaker-runtime', **AWS_ACCESS_INFO_DICT, config=config) as sagemaker_client:
+        result_img_url = await _get_userdata_for_model_outputs(id, assume_userdata_exist=True, increment_counter=True)
+        input_params_dict['result_url'] = result_img_url
+        sagemaker_response = await sagemaker_client.invoke_endpoint(
+            EndpointName=endpoint_name,
+            Body=json.dumps(input_params_dict),
+            ContentType='application/json',
+            Accept='application/json'
+        )
+        response_body = sagemaker_response['Body']
+        async with response_body as stream:
+            data = await stream.read()
+            logging.info(json.loads(data.decode()))
+    return result_img_url
+
+
+async def _send_result_img(id, result_img_url, caption):
+    current_result_img_url = await _get_userdata_for_model_outputs(id, assume_userdata_exist=True, increment_counter=False)
+    if current_result_img_url == result_img_url:
+        prefix = _get_prefix(id)
+        async with aioboto3.resource("s3", **AWS_ACCESS_INFO_DICT) as s3:
+            bucket_key = result_img_url[len("s3://") :]
+            bucket_name, key = bucket_key.split("/", 1)
+            result_s3_obj = await s3.Object(bucket_name, key)
+            result_img_as_bytes = await _read_s3_obj_as_bytes(result_s3_obj)
+        await bot.send_photo(id, result_img_as_bytes, caption=caption)                
+
+
 async def _invoke_nst_endpoint(id, content_img_url, style_img_url):
     # noinspection PyBroadException
     try:
-        config = aiobotocore.config.AioConfig(
-            read_timeout=1200,
-            retries={
-                'max_attempts': 0
-            }
+        result_img_url = await _sagemaker_invoke_endpoint(
+            id,
+            'NeuralStyleTransfer',
+            {'content_url': content_img_url, 'style_url': style_img_url, 'max_epochs': 10, 'n_steps_in_epoch': 20},
+            read_timeout=1200
         )
-        #sagemaker_runtime_client = boto3.client('sagemaker-runtime', config=config)
-        #sagemaker_client = Session(sagemaker_runtime_client=sagemaker_runtime_client)        
-        session = aiobotocore.get_session()
-        async with session.create_client('sagemaker-runtime', **AWS_ACCESS_INFO_DICT, config=config) as sagemaker_client:
-            result_img_url = await _get_userdata_for_model_outputs(id, assume_userdata_exist=True, increment_counter=True)
-            sagemaker_response = await sagemaker_client.invoke_endpoint(
-                EndpointName='NeuralStyleTransfer',
-                Body=json.dumps({'content_url': content_img_url, 'style_url': style_img_url, 'result_url': result_img_url, 'max_epochs': 10, 'n_steps_in_epoch': 20}),
-                ContentType='application/json',
-                Accept='application/json'
-            )
-            response_body = sagemaker_response['Body']
-            async with response_body as stream:
-                data = await stream.read()
-                logging.info(json.loads(data.decode()))
-        current_result_img_url = await _get_userdata_for_model_outputs(id, assume_userdata_exist=True, increment_counter=False)
-        if current_result_img_url == result_img_url:
-            prefix = _get_prefix(id)
-            async with aioboto3.resource("s3", **AWS_ACCESS_INFO_DICT) as s3:
-                bucket_key = result_img_url[len("s3://") :]
-                bucket_name, key = bucket_key.split("/", 1)
-                result_s3_obj = await s3.Object(bucket_name, key)
-                result_img_as_bytes = await _read_s3_obj_as_bytes(result_s3_obj)
-            await bot.send_photo(id, result_img_as_bytes, caption='stylized via NST')                
+        await _send_result_img(id, result_img_url, caption='stylized via NST')
     except Exception as e:
         logging.error(e)
         await bot.send_message(id, f"Request cannot be processed because the corresponding AWS resources are not launched, {MESSAGE_TO_CONTACT_SUPPORT}")
@@ -304,8 +320,14 @@ async def _invoke_nst_endpoint(id, content_img_url, style_img_url):
 async def _invoke_cyclegan_endpoint(id, content_img_url, style_name):
     # noinspection PyBroadException
     try:
-        # invoke_endpoint
-        raise Exception("Not yet implemented!")
+        model_name = CYCLEGAN_STYLENAME_TO_MODELNAME_DICT[style_name]
+        result_img_url = await _sagemaker_invoke_endpoint(
+            id,
+            'CycleGANStyleTransfer',
+            {'content_url': content_img_url, 'style_name': model_name},
+            read_timeout=60
+        )
+        await _send_result_img(id, result_img_url, caption=f'stylized via {style_name} CycleGAN')
     except Exception as e:
         logging.error(e)
         await bot.send_message(id, f"Request cannot be processed because the corresponding AWS resources are not launched, {MESSAGE_TO_CONTACT_SUPPORT}")

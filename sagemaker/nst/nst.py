@@ -35,7 +35,7 @@ def _s3_path_split(s3_path):
     return bucket_name, key
 
 
-def image_loader(s3_resource, image_url, device=None, image_size=None):
+def image_loader(s3_resource, image_url, device=None, image_size=None, max_width=800, max_height=600):
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Loading image {image_url} as bytes...")
@@ -47,7 +47,18 @@ def image_loader(s3_resource, image_url, device=None, image_size=None):
     else:
         image_as_bytes = requests.get(image_url, stream=True).raw
     logger.info(f"Loading image {image_url} as bytes: done")
-    image = Image.open(image_as_bytes)
+    image = Image.open(image_as_bytes).convert('RGB')
+    if image_size is None and (max_width is not None or max_height is not None):
+        width, height = image.size
+        x_scale_factor = 1.0
+        y_scale_factor = 1.0
+        if max_width is not None and width > max_width:
+            x_scale_factor = max_width / width
+        if max_height is not None and height > max_height:
+            y_scale_factor = max_height / height
+        scale_factor = min(x_scale_factor, y_scale_factor)
+        if scale_factor < 1.0:
+            image_size = (round(width * scale_factor), round(height * scale_factor))
     if image_size is None:
         loader = transforms.Compose([
             transforms.ToTensor(),
@@ -262,9 +273,9 @@ def transform_fn(model, data, content_type='application/json', output_content_ty
 
     result_img = train_and_get_result(lmodule, max_epochs=max_epochs, n_steps_in_epoch=n_steps_in_epoch)
     bucket_name, key = _s3_path_split(data['result_url'])
-    utils.save_image(result_img, 'result.jpg')
-    with open('result.jpg', 'rb') as f:
-        s3_resource.Bucket(bucket_name).Object(key).upload_fileobj(f)
-
+    result_img_as_bytes = io.BytesIO()
+    utils.save_image(result_img.squeeze(), result_img_as_bytes, format='jpeg')
+    result_img_as_bytes.seek(0)
+    s3_resource.Bucket(bucket_name).Object(key).upload_fileobj(result_img_as_bytes)
     response_body = json.dumps({'result_url': data['result_url']})
     return response_body, output_content_type
