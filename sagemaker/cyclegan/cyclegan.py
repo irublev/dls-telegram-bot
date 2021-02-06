@@ -19,6 +19,9 @@ logger.addHandler(logging.StreamHandler(sys.stdout))
 
 
 def _s3_path_split(s3_path):
+    '''
+    Split S3 path on bucket name and key
+    '''
     s3_path = s3_path.strip()
     if not s3_path.startswith("s3://"):
         raise ValueError(
@@ -30,6 +33,11 @@ def _s3_path_split(s3_path):
 
 
 def image_loader(s3_resource, image_url, image_size=None, max_width=800, max_height=600):
+    '''
+    Retrieve image as bytes either by URL or by S3 path, resize it either to given image size
+    or to make it fit to maximal width and height (the latter is just to avoid problems with memory),
+    normalize image (prerequisite for CycleGAN models) and return it as a PyTorch tensor
+    '''
     logger.info(f"Loading image {image_url} as bytes...")
     image_url = image_url.strip()
     if image_url.startswith('s3://'):
@@ -66,6 +74,9 @@ def image_loader(s3_resource, image_url, image_size=None, max_width=800, max_hei
 
 
 def get_result_image_as_bytes(result_img):
+    '''
+    Denormalize image tensor (because CycleGAN works with normalized images) and return it as bytes in JPEG format
+    '''
     result_img = transforms.Normalize((-1.0, -1.0, -1.0), (2.0, 2.0, 2.0))(result_img.squeeze())
     result_img_as_bytes = io.BytesIO()
     utils.save_image(result_img, result_img_as_bytes, format='jpeg')
@@ -195,6 +206,13 @@ class ResnetBlock(nn.Module):
 
 
 class Model(nn.Module):
+    '''
+    CycleGAN generator model, the original code is taken from https://github.com/mashyko/pytorch-CycleGAN-and-pix2pix
+    (written by Jun-Yan Zhu and Taesung Park), this original code is refactored to leave just the code
+    for the generator inference, so that all the default values for parameters are hard-coded by those
+    taken for test mode (thus both discriminator model and the code necessary for training are removed)
+    '''
+
     def __init__(self, model_dir, style_name):
         super(Model, self).__init__()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -278,10 +296,32 @@ class Model(nn.Module):
 
 
 def model_fn(model_dir):
+    '''
+    Callback used by SageMaker to create a model
+    
+    We are using this callback just to pass to transform_fn path to pth files with data for pretrained models,
+    these pth files are taken by SageMaker automatically from S3, they were put there by deploy_models.ipynb,
+    see it in the root folder of the project
+    '''
     return model_dir
 
 
 def transform_fn(model_dir, data, content_type='application/json', output_content_type='application/json'): 
+    '''
+    Callback used by SageMaker to retrieve inputs, pass them to a model, and return results
+
+    Inputs are given as JSON (or CSV file with the same fields, the latter is used for
+    SageMaker batch transform jobs) with the following fields:
+
+       content_url: URL or S3 path for content image
+       style_url: URL or S3 path for style image
+       result_url: S3 path where the result image is to be saved
+       max_epochs: maximal number of epoches to proceed
+       n_steps_in_epoch: number of steps per each epoch (see above NeuralStyleTransfer for details)
+
+    Output is JSON with the single field result_url containing S3 path where the result image is saved
+    '''
+
     if output_content_type != 'application/json':
         raise ValueError(f'Unsupported output content type: {output_content_type}')
 
@@ -294,16 +334,20 @@ def transform_fn(model_dir, data, content_type='application/json', output_conten
     else:
         raise ValueError(f'Unsupported content type: {content_type}')
     logger.info(data)
-        
+
+    # retrieve content image
     s3_resource = boto3.Session().resource('s3')    
     content_img = image_loader(s3_resource, data['content_url'])
-       
+
+    # constuct model, pass input and process it       
     model = Model(model_dir, data['style_name'])
     model.eval()
     model.set_input(content_img)
     model.test()
+    # convert result image tensor to bytes and put this to S3
     result_img_as_bytes = get_result_image_as_bytes(model.get_output())
     bucket_name, key = _s3_path_split(data['result_url'])
     s3_resource.Bucket(bucket_name).Object(key).upload_fileobj(result_img_as_bytes)
+    # return S3 path with the resulting image as an output
     response_body = json.dumps({'result_url': data['result_url']})
     return response_body, output_content_type

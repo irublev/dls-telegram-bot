@@ -32,6 +32,7 @@ dp = Dispatcher(bot)
 dp.middleware.setup(LoggingMiddleware())
 
 
+# parameters to connect to AWS
 REGION_NAME = os.environ['REGION']
 AWS_ACCESS_KEY_ID = os.environ['ACCESS_KEY']
 AWS_SECRET_ACCESS_KEY = os.environ['SECRET_KEY']
@@ -49,11 +50,15 @@ CYCLEGAN_STYLENAME_TO_MODELNAME_DICT = {
     "Monet": "style_monet",
     "Van Gogh":"style_vangogh",
     "Cezanne": "style_cezanne",
-    "Ukiyoe": "style_ukiyoe",
+    "Ukiyo-e": "style_ukiyoe",
 }
 
 
 def get_stylechoice_markup():
+    '''
+    Get ReplyKeyboardMarkup with choice of predefined styles corresponding to pretrained CycleGAN models
+    '''
+
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, selective=True, one_time_keyboard=True)
     markup.row_width = 2
     style_name_list = list(CYCLEGAN_STYLENAME_TO_MODELNAME_DICT.keys())
@@ -62,21 +67,43 @@ def get_stylechoice_markup():
 
 
 async def _read_s3_obj_as_bytes(s3_obj):
+    '''
+    Read object from S3 as bytes, i.e. raw contents of some file corresponding to this object
+    '''
+
     s3_obj_response = await s3_obj.get()
     s3_obj_body = s3_obj_response['Body']
     return await s3_obj_body.read()
 
 
 async def _read_s3_obj_as_string(s3_obj):
+   '''
+   Read object from S3 as string, i.e. contents of some text file corresponding to this object
+   '''
+
    s3_obj_content = await _read_s3_obj_as_bytes(s3_obj)
    return s3_obj_content.decode("utf-8")
 
 
 def _get_prefix(id):
+   '''
+   Get prefix in the bucket defined by AWS_DEFAULT_BUCKET for data corresponding to a certain chat with chat_id given by id
+   '''
+
    return f'userdata/{id}/'
 
 
 async def _get_userdata_for_model_inputs(id, assume_userdata_exist=False):
+    '''
+    Get info on model inputs for some chat with chat_id given by id
+ 
+    by default this function checks whether the corresponding folder exists and if not, then creates it
+    (not done if assume_userdata_exist equals to True), after this returns contents of files
+    content.txt and style.txt (or None if some of them do not exist), these files contain
+    URL to uploaded content image and either URL to uploaded style image or style name for predefined styles,
+    respectively  
+    '''
+
     prefix = _get_prefix(id)
     content_img_url = None
     style_img_url_or_name = None
@@ -103,6 +130,22 @@ async def _get_userdata_for_model_inputs(id, assume_userdata_exist=False):
 
 
 async def _get_userdata_for_model_outputs(id, assume_userdata_exist=False, increment_counter=False):
+    '''
+    Get info on model outputs for some chat with chat_id given by id
+
+    by default this function checks whether the corresponding folder exists and if not, then creates it
+    (not done if assume_userdata_exist equals to True), after this returns URL of current resulting image
+    (or None in the case no resulting image is expecting), this S3 path is based on the counter stored
+    in result_counter.txt file put on S3
+    if increment_counter is False (default), then this function returns S3 path based on the current value
+    of the counter, otherwise it increments the counter and then returns the respective S3 path, the latter
+    is done to prevent conflicts between resulting images obtained by already cancelled requests
+    and resulting images for new requests, that is some resulting image is to send to Telegram iff
+    current resulting image S3 path coincides with the one obtained from SageMaker (in the case when
+    we cancel some request or start a new one, we update the counter)
+
+    '''
+
     prefix = _get_prefix(id)
     result_counter = None
     result_img_url = None
@@ -137,6 +180,15 @@ async def _get_userdata_for_model_outputs(id, assume_userdata_exist=False, incre
 
 
 async def _put_userdata_for_model_inputs(id, input_file_name, input_value, assume_userdata_exist=False):
+    '''
+    Put some string given by input_value into some input file stored on S3 with info on one of model inputs
+    for some chat with chat_id given by id
+
+    by default this function checks whether the corresponding folder exists and if not, then creates it
+    (not done if assume_userdata_exist equals to True), after this it writes input_value into the file,
+    possibly overwriting the old contents, input_file_name may be equal to content.txt or style.txt
+    '''
+
     prefix = _get_prefix(id)
     async with aioboto3.resource("s3", **AWS_ACCESS_INFO_DICT) as s3:
         bucket = await s3.Bucket(AWS_DEFAULT_BUCKET)
@@ -154,6 +206,13 @@ async def _put_userdata_for_model_inputs(id, input_file_name, input_value, assum
 
 
 async def _clean_userdata(id, assume_userdata_exist=False):
+    '''
+    Clean all the files (save result_counter.txt) from user data folder in S3 for some chat with chat_id given by id
+
+    by default this function checks whether the corresponding folder exists and if not, then creates it
+    (not done if assume_userdata_exist equals to True), after this it cleans the folder
+    '''
+
     prefix = _get_prefix(id)
     async with aioboto3.resource("s3", **AWS_ACCESS_INFO_DICT) as s3:
         bucket = await s3.Bucket(AWS_DEFAULT_BUCKET)
@@ -175,36 +234,60 @@ async def _clean_userdata(id, assume_userdata_exist=False):
 
 @dp.message_handler(commands=['start', 'cancel'])
 async def start_or_cancel_handler(message: types.Message):
+    '''
+    Handle start or cancel commands
+    '''
+
     content_img_url, style_img_url_or_name = await _get_userdata_for_model_inputs(message.chat.id)
     if content_img_url is not None and style_img_url_or_name is not None and message.get_command() == '/start':
+        # if both content and style are already given, then we are already processing some request
         return SendMessage(message.chat.id, "We have an active request already processing, please wait or execute /cancel to stop the request execution")
+    # clean user data
     await _clean_userdata(message.chat.id)
     if message.get_command().lower() == '/start':
         return SendMessage(message.chat.id, "Please send me your image with content to stylize")
     elif content_img_url is None and style_img_url_or_name is None:
         return SendMessage(message.chat.id, "Nothing to cancel, please send me your image with content to stylize")
     else:
+        if content_img_url is not None and style_img_url_or_name is not None:
+            # this is necessary to prevent sending the resulting image for cancelled request, we just update the result counter
+            _ = await _get_userdata_for_model_outputs(id, assume_userdata_exist=True, increment_counter=True)
         return SendMessage(message.chat.id, "The request is cancelled, to make a new request please send me your image with content to stylize")
 
 
 @dp.message_handler(commands='help')
 async def help_handler(message: types.Message):
-    return SendMessage(message.chat.id, "Use /start or just send me your image with content to stylize to proceed with a new request, use /cancel to cancel already processing one")
+    '''
+    Handle help command
+    '''
+
+    return SendMessage(message.chat.id, 
+        "Use <b>/start</b> or just send me your image with content to stylize to proceed with a new request, " +
+        "use <b>/cancel</b> to cancel already processing one, " +
+        f"{MESSAGE_TO_CONTACT_SUPPORT} before start using this bot to make sure all the necessary AWS resources are launched",
+        parse_mode=types.ParseMode.HTML
+    )
 
 
 @dp.message_handler(content_types=[types.message.ContentType.PHOTO, types.message.ContentType.DOCUMENT])
 async def photo_handler(message: types.Message):
+    '''
+    Process uploaded image, by checking whether each of content_img_url and style_img_url_or_name equals None or not we determine is it content image or style image
+    '''
+
     content_img_url, style_img_url_or_name = await _get_userdata_for_model_inputs(message.chat.id)
     if content_img_url is not None and style_img_url_or_name is not None:
         return SendMessage(message.chat.id, "We have an active request already processing, please wait or execute /cancel to stop the request execution")
     file_id = None
     reply_str = None
     if message.document:
+        # get file id for uncompressed image uploaded as a document
         if message.document.mime_type and message.document.mime_type.startswith('image/'):
             file_id = message.document.file_id
         else:
             reply_str = "This document is not an image"
     elif message.photo:
+        # get file id for photo (i.e. compressed image), there are two images, take one with original size
         file_id = message.photo[-1].file_id
     else:
         reply_str = "Bad content"
@@ -225,11 +308,16 @@ async def photo_handler(message: types.Message):
     if content_img_url is None:
         await bot.send_message(message.chat.id, f"{reply_str}, please send me your image with content to stylize")
     else:
+        # content image is successfully processed, waiting for the style
         await bot.send_message(message.chat.id, f"{reply_str}, please send me your image with style to apply or choose the desired style name", reply_markup=get_stylechoice_markup())
 
 
 @dp.message_handler(lambda message: message.text in list(CYCLEGAN_STYLENAME_TO_MODELNAME_DICT.keys()))
 async def stylename_handler(message: types.Message):
+    '''
+    Process style name from the list of predefined styles
+    '''
+
     content_img_url, style_img_url_or_name = await _get_userdata_for_model_inputs(message.chat.id)
     if content_img_url is not None and style_img_url_or_name is not None:
         return SendMessage(message.chat.id, "We have an active request already processing, please wait or execute /cancel to stop the request execution")
@@ -242,6 +330,9 @@ async def stylename_handler(message: types.Message):
         asyncio.create_task(_invoke_cyclegan_endpoint(message.chat.id, content_img_url, style_img_url_or_name))
         return
 
+################################
+# some handlers for wrong inputs
+################################
 
 async def _wronginput_handler(reason_str: str, message: types.Message):
     content_img_url, style_img_url_or_name = await _get_userdata_for_model_inputs(message.chat.id)
@@ -264,8 +355,17 @@ async def wrongcontent_handler(message: types.Message):
     await _wronginput_handler("Bad content", message)
 
 
-async def _sagemaker_invoke_endpoint(id, endpoint_name, input_params_dict, read_timeout=60):
+############################################################################################################
+# auxiliary functions and handlers for invoking SageMaker endpoints and sending resulting images to Telegram
+############################################################################################################
+
+async def _sagemaker_invoke_endpoint(id, endpoint_name, input_params_dict, connect_timeout=60, read_timeout=60):
+    '''
+    Invoke SageMaker endpoint
+    '''
+
     config = aiobotocore.config.AioConfig(
+        connect_timeout=connect_timeout,
         read_timeout=read_timeout,
         retries={
             'max_attempts': 0
@@ -289,6 +389,10 @@ async def _sagemaker_invoke_endpoint(id, endpoint_name, input_params_dict, read_
 
 
 async def _send_result_img(id, result_img_url, caption):
+    '''
+    Get resulting image from S3 and send it to Telegram
+    '''
+
     current_result_img_url = await _get_userdata_for_model_outputs(id, assume_userdata_exist=True, increment_counter=False)
     if current_result_img_url == result_img_url:
         prefix = _get_prefix(id)
@@ -301,13 +405,17 @@ async def _send_result_img(id, result_img_url, caption):
 
 
 async def _invoke_nst_endpoint(id, content_img_url, style_img_url):
+    '''
+    Process content image by NST
+    '''
+
     # noinspection PyBroadException
     try:
         result_img_url = await _sagemaker_invoke_endpoint(
             id,
             'NeuralStyleTransfer',
-            {'content_url': content_img_url, 'style_url': style_img_url, 'max_epochs': 10, 'n_steps_in_epoch': 20},
-            read_timeout=1200
+            {'content_url': content_img_url, 'style_url': style_img_url, 'max_epochs': 14, 'n_steps_in_epoch': 10, 'lr': 0.01, 'patience': 5},
+            connect_timeout=1200, read_timeout=1200
         )
         await _send_result_img(id, result_img_url, caption='stylized via NST')
     except Exception as e:
@@ -318,6 +426,10 @@ async def _invoke_nst_endpoint(id, content_img_url, style_img_url):
 
 
 async def _invoke_cyclegan_endpoint(id, content_img_url, style_name):
+    '''
+    Process content image by pretrained CycleGAN model determined by style name
+    '''
+
     # noinspection PyBroadException
     try:
         model_name = CYCLEGAN_STYLENAME_TO_MODELNAME_DICT[style_name]
@@ -325,7 +437,7 @@ async def _invoke_cyclegan_endpoint(id, content_img_url, style_name):
             id,
             'CycleGANStyleTransfer',
             {'content_url': content_img_url, 'style_name': model_name},
-            read_timeout=60
+            connect_timeout=60, read_timeout=60
         )
         await _send_result_img(id, result_img_url, caption=f'stylized via {style_name} CycleGAN')
     except Exception as e:
