@@ -66,7 +66,7 @@ def image_loader(s3_resource, image_url, device=None, image_size=None, max_width
             y_scale_factor = max_height / height
         scale_factor = min(x_scale_factor, y_scale_factor)
         if scale_factor < 1.0:
-            image_size = (round(width * scale_factor), round(height * scale_factor))
+            image_size = (round(height * scale_factor), round(width * scale_factor))
     if image_size is None:
         loader = transforms.Compose([
             transforms.ToTensor(),
